@@ -107,13 +107,10 @@ RunLengthEncode(const char* input, char* output)
 void
 EvictScanLine()
 {
-  for (auto it = gScanLineLRU.begin(); it != gScanLineLRU.end(); it++) {
-    if (gNumCachedScanLines <= kScanLineCacheSize) {
-      return;
-    }
+  while (gNumCachedScanLines > kScanLineCacheSize) {
+    auto it = gScanLineLRU.begin();
 
     gNumCachedScanLines--;
-    delete[] it->second.bytes;
     gScanLineLRU.erase(it->first);
     gScanLineCache.erase(it->second);
   }
@@ -145,14 +142,7 @@ WriteScanLine(int fd, uint64_t* outOffset, const char* scanLine)
   gNumCachedScanLines++;
   EvictScanLine();
 
-  char* bytes = new char[gWidth];
-  memcpy(bytes, scanLine, gWidth);
-
-  CachedScanLine copy(bytes, 0);
-  gScanLineLRU.insert(std::make_pair(gNow, std::move(copy)));
-
-  CachedScanLine* cached = &const_cast<CachedScanLine&>(*result.first);
-  cached->bytes = bytes;
+  gScanLineLRU.insert(std::make_pair(gNow, CachedScanLine(scanLine, 0)));
 
   char buffer[kMaxScanLineWidth];
   size_t size = RunLengthEncode(scanLine, buffer);
@@ -210,6 +200,8 @@ main(int argc, char** argv)
 
   size_t processed = 0;
   while (processed < length) {
+    printf("offset %zu / %zu\n", processed, length);
+
     // Assume everyone uses little endian.
     write(indexfd, &outOffset, sizeof(uint64_t));
 

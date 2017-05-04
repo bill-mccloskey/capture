@@ -4,6 +4,7 @@
 #include "DeckLinkAPIDispatch.cpp"
 
 #include <atomic>
+#include <assert.h>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -25,70 +26,23 @@ Now()
   return double(tv.tv_usec) / 1000000.0 + double(tv.tv_sec);
 }
 
-void
-PrintDisplayModes(IDeckLink* deckLink)
-{
-  IDeckLinkDisplayMode*	displayMode;
-  IDeckLinkInput* deckLinkInput;
-  IDeckLinkDisplayModeIterator*	displayModeIterator;
-
-  if (deckLink->QueryInterface(IID_IDeckLinkInput, (void**)&deckLinkInput) != S_OK) {
-    Fail("IDeckLinkInput QI failed");
-  }
-
-  if (deckLinkInput->GetDisplayModeIterator(&displayModeIterator) != S_OK) {
-    Fail("GetDisplayModeIterator failed");
-  }
-
-  while (displayModeIterator->Next(&displayMode) == S_OK) {
-    long width, height;
-    BMDTimeValue frameRate;
-    BMDTimeScale timeScale;
-    width = displayMode->GetWidth();
-    height = displayMode->GetHeight();
-    displayMode->GetFrameRate(&frameRate, &timeScale);
-
-    BMDDisplayModeSupport support;
-    if (deckLinkInput->DoesSupportVideoMode(displayMode->GetDisplayMode(),
-                                            bmdFormat8BitYUV,
-                                            bmdVideoInputFlagDefault,
-                                            &support, nullptr) != S_OK) {
-      Fail("DoesSupportDisplayMode failed");
-    }
-
-    float fps = float(timeScale) / float(frameRate);
-    if (support == bmdDisplayModeSupported && fps >= 58) {
-      printf("Found display mode:\n");
-      printf("  w=%ld h=%ld\n", width, height);
-      printf("  rate=%f\n", fps);
-    }
-
-    RELEASE(displayMode);
-  }
-
-  RELEASE(deckLinkInput);
-  RELEASE(displayModeIterator);
-}
-
-const int kWidth = 3840;
-const int kHeight = 2160;
-
 // We drop every second x and y pixels.
-const size_t kFrameSize = kWidth * kHeight / 2 / 2;
+const size_t kMaxFrameSize = 3840 * 2160 / 2 / 2;
 
 // One minute max.
 const size_t kMaxFrames = 60 * 60;
 
-const size_t kFrameBufferSize = kMaxFrames * kFrameSize;
+const size_t kFrameBufferSize = kMaxFrames * kMaxFrameSize;
 
 class CaptureCallback : public IDeckLinkInputCallback
 {
 public:
-  CaptureCallback(char* frameBuffer)
+  CaptureCallback(IDeckLinkInput* input, char* frameBuffer)
    : mRefCount(1)
+   , mInput(input)
    , mFrameBuffer(frameBuffer)
-   , mLastFrame(0)
-   , mMaxInterArrivalTime(0)
+   , mWidth(0)
+   , mHeight(0)
   {}
 
   virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *ppv) {
@@ -117,64 +71,30 @@ public:
   VideoInputFrameArrived(IDeckLinkVideoInputFrame*,
                          IDeckLinkAudioInputPacket*);
 
-  double MaxInterArrivalTime() const { return mMaxInterArrivalTime; }
+  void GetSize(size_t* width, size_t* height) {
+    *width = mWidth;
+    *height = mHeight;
+  }
 
 private:
   std::atomic<int32_t> mRefCount;
+  IDeckLinkInput* mInput;
   char* mFrameBuffer;
-  double mLastFrame;
-  double mMaxInterArrivalTime;
+  size_t mWidth, mHeight;
 };
 
 static std::atomic<uint32_t> gFrameCounter(0);
 
-// Keeps in YUV, drops 3 of every 4 pixels in both dimensions.
+// Data is expected to be in UYVY format, with 32 bits for every two pixels.
 void
-ReduceFrameBy16(char* frameBytes, char* result)
+ReduceFrameBy8(size_t width, size_t height, char* frameBytes, char* result)
 {
-  const size_t rowBytes = kWidth * 2;
+  const size_t rowBytes = width * 2;
 
   char* input = frameBytes;
   char* output = result;
 
-  for (size_t h = 0; h < kHeight; h += 4) {
-    for (size_t i = 0; i < rowBytes; i += 16) {
-      char cb0 = *input++;
-      char y0 = *input++;
-      char cr0 = *input++;
-      input++; // y1;
-
-      input += 4;
-
-      input++; // cb0
-      char y01 = *input++;
-      input++; // cr
-      input++; // y1
-
-      input += 4;
-
-      *output++ = cb0;
-      *output++ = y0;
-      *output++ = cr0;
-      *output++ = y01;
-    }
-
-    // Skip the next three rows.
-    input += rowBytes;
-    input += rowBytes;
-    input += rowBytes;
-  }
-}
-
-void
-ReduceFrameBy8(char* frameBytes, char* result)
-{
-  const size_t rowBytes = kWidth * 2;
-
-  char* input = frameBytes;
-  char* output = result;
-
-  for (size_t h = 0; h < kHeight; h += 2) {
+  for (size_t h = 0; h < height; h += 2) {
     for (size_t i = 0; i < rowBytes; i += 4) {
       input++; // cb0
       char y0 = *input++;
@@ -189,23 +109,58 @@ ReduceFrameBy8(char* frameBytes, char* result)
   }
 }
 
+size_t
+ProcessFrame(size_t width, size_t height, char* frameBytes, char* result)
+{
+  const size_t rowBytes = width * 4;
+
+  char* input = frameBytes;
+  char* output = result;
+
+  for (size_t h = 0; h < height; h++) {
+    for (size_t i = 0; i < rowBytes; i += 4) {
+      input++; // alpha
+      char red = *input++;
+      char green = *input++;
+      char blue = *input++;
+
+      // Actual multipliers should be:
+      // red: 0.299
+      // green: 0.587
+      // blue: 0.114
+      int32_t luminosity = (red >> 2) + (green >> 1) + (blue >> 3);
+      *output++ = luminosity;
+    }
+
+    // Skip the next row.
+    //input += rowBytes;
+  }
+
+  return width * height;
+}
+
 HRESULT
 CaptureCallback::VideoInputFrameArrived(IDeckLinkVideoInputFrame* videoFrame,
                                         IDeckLinkAudioInputPacket* audioFrame)
 {
+  printf("frame!\n");
+  if (!mWidth) return S_OK;
+  assert(mWidth != 0);
+  assert(mHeight != 0);
+
   if (!videoFrame) {
     printf("No video in frame!\n");
     return S_OK;
   }
-
-  //printf("Got frame\n");
 
   BMDTimeValue time, duration;
   if (videoFrame->GetStreamTime(&time, &duration, 60000) != S_OK) {
     Fail("GetStreamTime failed");
   }
 
-  printf("Frame %lld\n", time / duration);
+  void* frameBytes;
+  videoFrame->GetBytes(&frameBytes);
+  printf("Frame %lld %p\n", time / duration, frameBytes);
 
   if (videoFrame->GetFlags() & bmdFrameHasNoInputSource) {
     printf("  [frame has no input source!]\n");
@@ -213,8 +168,9 @@ CaptureCallback::VideoInputFrameArrived(IDeckLinkVideoInputFrame* videoFrame,
     void* frameBytes;
     videoFrame->GetBytes(&frameBytes);
 
-    ReduceFrameBy8((char*)frameBytes, mFrameBuffer);
-    mFrameBuffer += kFrameSize;
+    mFrameBuffer += ProcessFrame(mWidth, mHeight, (char*)frameBytes, mFrameBuffer);
+    //ReduceFrameBy8(mWidth, mHeight, (char*)frameBytes, mFrameBuffer);
+    //mFrameBuffer += mWidth * mHeight / 2 / 2;
   }
 
   gFrameCounter++;
@@ -226,7 +182,35 @@ CaptureCallback::VideoInputFormatChanged(BMDVideoInputFormatChangedEvents events
                                          IDeckLinkDisplayMode *mode,
                                          BMDDetectedVideoInputFormatFlags formatFlags)
 {
-  printf("VideoInputFormatChanged\n");
+  BMDTimeValue t, scale;
+  mode->GetFrameRate(&t, &scale);
+  printf("format changed\n");
+  printf("%ld x %ld %f fpd\n", mode->GetWidth(), mode->GetHeight(),
+         float(scale) / float(t));
+
+  assert(mWidth == 0);
+  assert(mHeight == 0);
+
+  mWidth = mode->GetWidth();
+  mHeight = mode->GetHeight();
+
+  mInput->PauseStreams();
+
+  BMDDisplayModeSupport support;
+  mInput->DoesSupportVideoMode(mode->GetDisplayMode(),
+                               bmdFormat8BitARGB,
+                               bmdVideoInputFlagDefault,
+                               &support, nullptr);
+  printf("support: %d\n", support == bmdDisplayModeSupported);
+
+  if (mInput->EnableVideoInput(mode->GetDisplayMode(),
+                               bmdFormat8BitARGB,
+                               bmdVideoInputEnableFormatDetection) != S_OK) {
+    Fail("EnableVideoInput failed from VideoInputFormatChanged");
+  }
+
+  mInput->FlushStreams();
+  mInput->StartStreams();
   return S_OK;
 }
 
@@ -250,22 +234,18 @@ main()
   }
   RELEASE(deckLinkIterator);
 
-  printf("IF: %p\n", deckLink);
-
-  PrintDisplayModes(deckLink);
-
   IDeckLinkInput* input;
   if (deckLink->QueryInterface(IID_IDeckLinkInput, (void**)&input) != S_OK) {
     Fail("IDeckLinkInput QI failed");
   }
 
-  if (input->EnableVideoInput(bmdMode4K2160p5994,
-                              bmdFormat8BitYUV,
+  if (input->EnableVideoInput(bmdModeHD1080p5994,
+                              bmdFormat8BitARGB,
                               bmdVideoInputEnableFormatDetection) != S_OK) {
     Fail("EnableVideoInput failed");
   }
 
-  CaptureCallback* callback = new CaptureCallback(frameBuffer);
+  CaptureCallback* callback = new CaptureCallback(input, frameBuffer);
   input->SetCallback(callback);
 
   input->StartStreams();
@@ -287,6 +267,9 @@ main()
 
   printf("Finished recording.\n");
 
+  size_t width, height;
+  callback->GetSize(&width, &height);
+
   input->SetCallback(nullptr);
   RELEASE(callback);
 
@@ -297,13 +280,14 @@ main()
 
   int fd = open("video.raw", O_WRONLY|O_CREAT|O_TRUNC, 0664);
 
-  uint16_t data = kWidth / 2;
+  uint16_t data = width;
   write(fd, &data, sizeof(data));
-  data = kHeight / 2;
+  data = height;
   write(fd, &data, sizeof(data));
 
+  size_t frameSize = width * height;
   for (int i = 0; i < kNumFrames; i++) {
-    write(fd, frameBuffer + (i * kFrameSize), kFrameSize);
+    write(fd, frameBuffer + (i * frameSize), frameSize);
   }
   close(fd);
 
