@@ -1,0 +1,25 @@
+<html>
+  <head>
+    <title>Mozilla video capture</title>
+
+    <style type="text/css">
+      progress {
+        width: 1920px;
+      }
+
+      .infobar {
+        font-family: sans-serif;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div class="infobar">
+      Frame <span id="status"></span>. Press space to play/pause. Use left/right arrow to move frame-by-frame when paused.
+    </div>
+    <progress id="progress" max="1000" value="0"></progress>
+    <canvas id="canvas" width="1920" height="1080"></canvas>
+
+    <script src="decode.js"></script>
+  </body>
+</html>
