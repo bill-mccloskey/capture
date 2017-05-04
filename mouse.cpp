@@ -124,7 +124,7 @@ main(int argc, char* argv[])
                 }
             }
         } else if (ev.type == EV_REL) { // movement
-            if (abs(ev.value) >= 5 || 1) {
+            if (abs(ev.value) >= 5) {
                 Write(0x6f, usb_fd);
             }
 

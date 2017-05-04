@@ -68,7 +68,7 @@ int main()
 
     Setup(usb_fd);
 
-#if 0
+#if 1
     Write(36, usb_fd);
     Write(164, usb_fd);
 

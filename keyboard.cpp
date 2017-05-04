@@ -161,6 +161,8 @@ main(int argc, char* argv[])
                 usb_code += 128;
             }
 
+            printf("sending code %d\n", usb_code);
+
             Write(usb_code, usb_fd);
         }
     }
