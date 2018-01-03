@@ -112,24 +112,29 @@ Decoder.prototype.decodeFrame = function(frameIndex, output) {
   }
 };
 
-function start(decoder) {
+function start(decoder1, decoder2) {
   let progressElt = document.getElementById("progress");
   let statusElt = document.getElementById("status");
-  let canvas = document.getElementById("canvas");
-  let ctx = canvas.getContext("2d");
-  let imageData = ctx.createImageData(decoder.width, decoder.height);
+  let canvas1 = document.getElementById("canvas1");
+  let canvas2 = document.getElementById("canvas2");
+  let ctx1 = canvas1.getContext("2d");
+  let ctx2 = canvas2.getContext("2d");
+  let imageData1 = ctx1.createImageData(decoder1.width, decoder1.height);
+  let imageData2 = ctx2.createImageData(decoder2.width, decoder2.height);
 
-  progressElt.setAttribute("max", decoder.numFrames - 1);
+  progressElt.setAttribute("max", decoder1.numFrames - 1);
 
   let frameIndex = 0;
   let playing = true;
 
   function draw() {
-    decoder.decodeFrame(frameIndex, imageData.data);
-    ctx.putImageData(imageData, 0, 0);
+    decoder1.decodeFrame(frameIndex, imageData1.data);
+    decoder2.decodeFrame(frameIndex, imageData2.data);
+    ctx1.putImageData(imageData1, 0, 0);
+    ctx2.putImageData(imageData2, 0, 0);
 
     progressElt.setAttribute("value", frameIndex);
-    statusElt.innerHTML = (frameIndex + 1) + "/" + decoder.numFrames;
+    statusElt.innerHTML = (frameIndex + 1) + "/" + decoder1.numFrames;
   }
 
   function playOne() {
@@ -137,7 +142,7 @@ function start(decoder) {
       return;
     }
 
-    if (frameIndex == decoder.numFrames - 1) {
+    if (frameIndex == decoder1.numFrames - 1) {
       playing = false;
       return;
     }
@@ -150,7 +155,7 @@ function start(decoder) {
   requestAnimationFrame(playOne);
 
   document.addEventListener("keypress", (event) => {
-    if (event.key == "ArrowRight" && frameIndex < decoder.numFrames - 1) {
+    if (event.key == "ArrowRight" && frameIndex < decoder1.numFrames - 1) {
       frameIndex++;
       draw();
       event.preventDefault();
@@ -159,7 +164,7 @@ function start(decoder) {
       draw();
       event.preventDefault();
     } else if (event.key == " ") {
-      if (!playing && frameIndex == decoder.numFrames - 1) {
+      if (!playing && frameIndex == decoder1.numFrames - 1) {
         return;
       }
       playing = !playing;
@@ -172,14 +177,35 @@ function start(decoder) {
 
   progressElt.addEventListener("click", (event) => {
     let percent = (event.pageX  - (progressElt.offsetLeft + progressElt.offsetParent.offsetLeft)) / progressElt.offsetWidth;
-    frameIndex = Math.floor(percent * decoder.numFrames);
+    frameIndex = Math.floor(percent * decoder1.numFrames);
     playing = false;
     draw();
   });
 }
 
-Promise.all([sendRequest("video.pop"), sendRequest("video.idx")]).then(
-  ([pop, idx]) => {
-    let decoder = new Decoder(pop, idx);
-    start(decoder);
-  });
+console.log("hello");
+
+let urlParams = new URLSearchParams(window.location.search);
+let base1 = urlParams.get("l");
+let base2 = urlParams.get("l2");
+
+let files = [
+  sendRequest(base1 + "/video.pop"),
+  sendRequest(base1 + "/video.idx"),
+];
+
+if (base2) {
+  files.push(sendRequest(base2 + "/video.pop"));
+  files.push(sendRequest(base2 + "/video.idx"));
+}
+
+console.log(files);
+
+Promise.all(files).then((files) => {
+  let decoder1 = new Decoder(files[0], files[1]);
+  let decoder2 = decoder1;
+  if (files.length > 2) {
+    decoder2 = new Decoder(files[2], files[3]);
+  }
+  start(decoder1, decoder2);
+});

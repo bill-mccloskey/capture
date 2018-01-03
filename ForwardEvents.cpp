@@ -34,17 +34,22 @@ struct Forwarder
     , mRelX(0)
     , mRelY(0)
     , mRelWheel(0)
-    , mPlayAudio(false)
+    , mPlayAudio(0)
     , mFinished(false)
   {}
 
-  void Init(const char* keyName, const char* mouseName);
+  bool IsRecording() const { return !mIsReplay; }
+  bool IsReplay() const { return mIsReplay; }
+
+  void InitRecord(const char* keyName, const char* mouseName, const char* outputName);
+  void InitReplay(const char* inputName);
   void Finish();
 
   void KeyboardThread();
   void MouseThread();
   void OutputThread();
   void AudioThread();
+  void ReplayThread();
 
 private:
   void MakeKeyTable();
@@ -54,6 +59,9 @@ private:
   void OutputRel(int amt, char negCmd, char posCmd);
 
   void BufferCommand(char cmd);
+
+  FILE* mReplayFile;
+  bool mIsReplay;
 
   char mKeyTable[128];
 
@@ -69,7 +77,8 @@ private:
   int mOutputFile;
 
   int mPlayAudio;
-  double mPlayStart;
+
+  double mStartTime;
 
   std::atomic<bool> mFinished;
 };
@@ -165,6 +174,10 @@ Forwarder::SetupOutput(int fd)
 void
 Forwarder::OutputCommand(char ch)
 {
+  if (IsRecording()) {
+    fprintf(mReplayFile, "%f %d\n", Now() - mStartTime, ch);
+  }
+
   if (write(mOutputFile, &ch, 1) != 1) {
     perror("write");
     exit(1);
@@ -179,12 +192,19 @@ void
 Forwarder::BufferCommand(char cmd)
 {
   std::lock_guard<std::mutex> guard(mMutex);
+  assert(mCmdBufWrite + 1 < sizeof(mCmdBuf));
   mCmdBuf[mCmdBufWrite++] = cmd;
 }
 
 void
 Forwarder::KeyboardThread()
 {
+  if (IsReplay()) {
+    return;
+  }
+
+  int prevMakeCode = 0;
+
   while (!mFinished) {
     struct input_event ev;
 
@@ -201,17 +221,28 @@ Forwarder::KeyboardThread()
       }
 
       bool make = ev.value;
-      char usb_code = mKeyTable[ev.code];
-      if (!usb_code) {
+      char usbCode = mKeyTable[ev.code];
+      if (!usbCode) {
         printf("unexpected unmapped code: %d\n", ev.code);
         continue;
       }
 
       if (!make) {
-        usb_code += 128;
+        prevMakeCode = 0;
       }
 
-      BufferCommand(usb_code);
+      if (ev.code == prevMakeCode) {
+        // Don't send a command multiple times for the same key.
+        continue;
+      }
+
+      if (!make) {
+        usbCode += 128;
+      } else {
+        prevMakeCode = ev.code;
+      }
+
+      BufferCommand(usbCode);
     }
   }
 }
@@ -219,6 +250,10 @@ Forwarder::KeyboardThread()
 void
 Forwarder::MouseThread()
 {
+  if (IsReplay()) {
+    return;
+  }
+
   while (!mFinished) {
     struct input_event ev;
 
@@ -281,6 +316,47 @@ Forwarder::OutputRel(int amt, char negCmd, char posCmd)
 }
 
 void
+Forwarder::ReplayThread()
+{
+  printf("Replay...\n");
+
+  for (;;) {
+    float t;
+    int cmd;
+    if (fscanf(mReplayFile, "%f %d", &t, &cmd) != 2) {
+      break;
+    }
+
+    double goal = mStartTime + double(t);
+    double diff = (mStartTime + double(t) - Now()) * 0.9;
+
+    if (diff > 0) {
+      usleep(diff * 1e6);
+    } else {
+      printf("LAG!\n");
+    }
+
+    while (Now() < goal) {}
+
+    printf("time diff = %f\n", Now() - goal);
+
+    OutputCommand(cmd);
+
+    if ((cmd >= 0x42 && cmd <= 0x45) || cmd == 0x58 || cmd == 0x57) {
+      // it's a mouse command
+    } else {
+      std::lock_guard<std::mutex> guard(mMutex);
+      if (cmd > 0) {
+        mPlayAudio = 1;
+      }
+      printf("play %d\n", mPlayAudio);
+    }
+  }
+
+  mFinished = true;
+}
+
+void
 Forwarder::OutputThread()
 {
   while (!mFinished) {
@@ -309,8 +385,10 @@ Forwarder::OutputThread()
       OutputCommand(command);
 
       std::lock_guard<std::mutex> guard(mMutex);
-      mPlayAudio = true;
-      mPlayStart = Now();
+      if (command > 0) {
+        mPlayAudio = 1;
+        printf("play %d\n", mPlayAudio);
+      }
     } else if (relX || relY || relWheel) {
       printf("output: x=%d, y=%d, z=%d\n", relX, relY, relWheel);
       OutputRel(relX, 0x42, 0x43);
@@ -335,49 +413,41 @@ Forwarder::AudioThread()
                            SND_PCM_FORMAT_U8,
                            SND_PCM_ACCESS_RW_INTERLEAVED,
                            1,
-                           44000,
+                           48000,
                            1,
-                           4000);
+                           3000);
   if (err < 0) {
     printf("Playback open error: %s\n", snd_strerror(err));
     exit(1);
   }
 
-  const size_t bufferSize = 11;
-  unsigned char onBuffer[bufferSize], offBuffer[bufferSize];
+  const size_t bufferSize = 80;
+  unsigned char buffer0[bufferSize];
+  unsigned char buffer1[bufferSize];
 
-  for (int i = 0; i < bufferSize; i++) {
-    onBuffer[i] = i % 2 == 0 ? 255 : 0;
-    offBuffer[i] = 0;
+  for (size_t i = 0; i < bufferSize; i++) {
+    buffer0[i] = 128;
+    buffer1[i] = i % 2 == 0 ? 255 : 0;
   }
 
   while (!mFinished) {
-    bool play;
-    double start;
+    int play;
     {
       std::lock_guard<std::mutex> guard(mMutex);
       play = mPlayAudio;
-      start = mPlayStart;
-      mPlayAudio = false;
+      mPlayAudio = 0;
     }
 
-    if (play) {
-      double t = Now () - start;
-      printf("audio delay: %g\n", t);
+    unsigned char* buffer;
+    if (play == 0) {
+      buffer = buffer0;
+    } else if (play == 1) {
+      buffer = buffer1;
     }
 
-    unsigned char* buffer = play ? onBuffer : offBuffer;
-
-    snd_pcm_sframes_t frames = snd_pcm_writei(handle, buffer, sizeof(onBuffer));
-    if (frames < 0) {
-      frames = snd_pcm_recover(handle, frames, 0);
-    }
-    if (frames < 0) {
+    snd_pcm_sframes_t frames = snd_pcm_writei(handle, buffer, bufferSize);
+    if (frames != (long)bufferSize) {
       printf("snd_pcm_writei failed: %s\n", snd_strerror(frames));
-      exit(1);
-    }
-    if (frames > 0 && frames < (long)sizeof(onBuffer)) {
-      printf("Short write (expected %li, wrote %li)\n", (long)sizeof(onBuffer), frames);
       exit(1);
     }
   }
@@ -386,7 +456,7 @@ Forwarder::AudioThread()
 }
 
 void
-Forwarder::Init(const char* keyName, const char* mouseName)
+Forwarder::InitRecord(const char* keyName, const char* mouseName, const char* outputName)
 {
   MakeKeyTable();
 
@@ -416,6 +486,26 @@ Forwarder::Init(const char* keyName, const char* mouseName)
   }
 
   SetupOutput(mOutputFile);
+
+  mIsReplay = false;
+  mReplayFile = fopen(outputName, "w");
+  mStartTime = Now();
+}
+
+void
+Forwarder::InitReplay(const char* inputName)
+{
+  mOutputFile = open("/dev/ttyUSB0", O_RDWR | O_NOCTTY);
+  if (mOutputFile == -1) {
+    perror("open");
+    exit(1);
+  }
+
+  SetupOutput(mOutputFile);
+
+  mIsReplay = true;
+  mReplayFile = fopen(inputName, "r");
+  mStartTime = Now();
 }
 
 void
@@ -423,6 +513,8 @@ Forwarder::Finish()
 {
   // Clear the buffer.
   OutputCommand(0x38);
+
+  fclose(mReplayFile);
 }
 
 int
@@ -430,13 +522,21 @@ main(int argc, char* argv[])
 {
   Forwarder fwd;
 
-  fwd.Init(argv[1], argv[2]);
+  if (argc == 4) {
+    fwd.InitRecord(argv[1], argv[2], argv[3]);
+  } else {
+    fwd.InitReplay(argv[1]);
+  }
 
   std::thread keyboard_in(&Forwarder::KeyboardThread, std::ref(fwd));
   std::thread mouse_in(&Forwarder::MouseThread, std::ref(fwd));
   std::thread audio_out(&Forwarder::AudioThread, std::ref(fwd));
 
-  fwd.OutputThread();
+  if (fwd.IsReplay()) {
+    fwd.ReplayThread();
+  } else {
+    fwd.OutputThread();
+  }
 
   keyboard_in.join();
   mouse_in.join();
