@@ -9,6 +9,8 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "EncodeLib.h"
+
 #define RELEASE(p) do { (p)->Release(); (p) = nullptr; } while (0)
 
 void
@@ -84,6 +86,8 @@ private:
 };
 
 static std::atomic<uint32_t> gFrameCounter(0);
+static std::atomic<uint32_t> gSkipFrameCounter(0);
+static bool gHasFirstFrame;
 
 // Data is expected to be in UYVY format, with 32 bits for every two pixels.
 void
@@ -110,7 +114,7 @@ ReduceFrameBy8(size_t width, size_t height, char* frameBytes, char* result)
 }
 
 size_t
-ProcessFrame(size_t width, size_t height, char* frameBytes, char* result)
+ProcessFrame(size_t width, size_t height, char* frameBytes, char* result, int decoration)
 {
   const size_t rowBytes = width * 4;
 
@@ -118,18 +122,25 @@ ProcessFrame(size_t width, size_t height, char* frameBytes, char* result)
   char* output = result;
 
   for (size_t h = 0; h < height; h++) {
+    bool invert = decoration;
+#if 0
+    if (decoration == 1 && h < height/2) {
+      invert = true;
+    }
+    if (decoration == 2 && h >= height/2) {
+      invert = true;
+    }
+#endif
     for (size_t i = 0; i < rowBytes; i += 4) {
-      input++; // alpha
-      char red = *input++;
-      char green = *input++;
-      char blue = *input++;
+      char first = *input++; // alpha
+      char second = *input++;
+      char third = *input++;
+      char fourth = *input++;
 
-      // Actual multipliers should be:
-      // red: 0.299
-      // green: 0.587
-      // blue: 0.114
-      int32_t luminosity = (red >> 2) + (green >> 1) + (blue >> 3);
-      *output++ = luminosity;
+      // Not sure why, but this channel seems to contain the luminosity.
+      int32_t luminosity = third;
+
+      *output++ = invert ? 256 - luminosity : luminosity;
     }
 
     // Skip the next row.
@@ -143,7 +154,7 @@ HRESULT
 CaptureCallback::VideoInputFrameArrived(IDeckLinkVideoInputFrame* videoFrame,
                                         IDeckLinkAudioInputPacket* audioFrame)
 {
-  printf("frame!\n");
+  printf("Frame");
   if (!mWidth) return S_OK;
   assert(mWidth != 0);
   assert(mHeight != 0);
@@ -153,14 +164,103 @@ CaptureCallback::VideoInputFrameArrived(IDeckLinkVideoInputFrame* videoFrame,
     return S_OK;
   }
 
+  if (!audioFrame) {
+    printf("No audio in frame\n");
+    return S_OK;
+  }
+
+  gSkipFrameCounter++;
+  if (gSkipFrameCounter <= 60) {
+    return S_OK;
+  }
+
   BMDTimeValue time, duration;
   if (videoFrame->GetStreamTime(&time, &duration, 60000) != S_OK) {
     Fail("GetStreamTime failed");
   }
 
+  long audioFrameCount = audioFrame->GetSampleFrameCount();
+  //printf("audio sample frame count = %ld\n", audioFrameCount);
+
+  BMDTimeValue audioTime;
+  if (audioFrame->GetPacketTime(&audioTime, 60000) != S_OK) {
+    Fail("GetPacketTime failed");
+  }
+
   void* frameBytes;
   videoFrame->GetBytes(&frameBytes);
-  printf("Frame %lld %p\n", time / duration, frameBytes);
+  printf(" %lld", time / duration);
+
+  printf(" (audio %lld)", audioTime / duration);
+
+  void* audioBuffer;
+  audioFrame->GetBytes(&audioBuffer);
+  int16_t* audioBytes = static_cast<int16_t*>(audioBuffer);
+
+#if 0
+  int type = 0;
+  for (size_t i = 0; i < audioFrameCount * 2; i += 2) {
+    if (audioBytes[i] > 100) {
+      int dips = 0;
+      for (size_t j = 0; j < 20 && i + j < audioFrameCount * 2; j += 2) {
+        printf(" %d", audioBytes[i + j]);
+        if (audioBytes[i + j] < 0) {
+          dips++;
+        }
+      }
+
+      if (dips >= 3) {
+        type = 1;
+      } else {
+        type = 2;
+      }
+      i = i + 30;
+    }
+  }
+#endif
+
+  int type = 0;
+  for (size_t i = 0; i < audioFrameCount * 2; i += 2) {
+    if (audioBytes[i] > 100) {
+      type = 1;
+    }
+  }
+
+  if (type) {
+    gHasFirstFrame = true;
+
+    printf(" type = %d", type);
+  }
+
+#if 0
+  double sum = 0;
+  for (size_t i = 0; i < audioFrameCount * 2; i += 2) {
+    sum += audioBytes[i];
+  }
+  double avg = sum / audioFrameCount;
+
+  double sumSq = 0;
+  for (size_t i = 0; i < audioFrameCount * 2; i += 2) {
+    double dev = audioBytes[i] - avg;
+    sumSq += dev * dev;
+  }
+
+  double stddev = sqrt(sumSq / audioFrameCount);
+
+  if (stddev > 100) {
+    printf(" [mean %f, stddev = %f]", avg, stddev);
+  }
+#endif
+
+  printf("\n");
+
+  if (!gHasFirstFrame) {
+    return S_OK;
+  }
+
+  //printf("first sample: %d %d %d %d %d %d\n", audioBytes[0], audioBytes[1],
+  //       audioBytes[2], audioBytes[3],
+  //       audioBytes[4], audioBytes[5]);
 
   if (videoFrame->GetFlags() & bmdFrameHasNoInputSource) {
     printf("  [frame has no input source!]\n");
@@ -168,7 +268,7 @@ CaptureCallback::VideoInputFrameArrived(IDeckLinkVideoInputFrame* videoFrame,
     void* frameBytes;
     videoFrame->GetBytes(&frameBytes);
 
-    mFrameBuffer += ProcessFrame(mWidth, mHeight, (char*)frameBytes, mFrameBuffer);
+    mFrameBuffer += ProcessFrame(mWidth, mHeight, (char*)frameBytes, mFrameBuffer, type);
     //ReduceFrameBy8(mWidth, mHeight, (char*)frameBytes, mFrameBuffer);
     //mFrameBuffer += mWidth * mHeight / 2 / 2;
   }
@@ -209,15 +309,45 @@ CaptureCallback::VideoInputFormatChanged(BMDVideoInputFormatChangedEvents events
     Fail("EnableVideoInput failed from VideoInputFormatChanged");
   }
 
+  if (mInput->EnableAudioInput(bmdAudioSampleRate48kHz,
+                               bmdAudioSampleType16bitInteger,
+                               2) != S_OK) {
+    Fail("EnableAudioInput failed");
+  }
+
   mInput->FlushStreams();
   mInput->StartStreams();
   return S_OK;
 }
 
+void
+WriteRaw(const char* fname, int width, int height, char* frameBuffer, int numFrames)
+{
+  int fd = open(fname, O_WRONLY|O_CREAT|O_TRUNC, 0664);
+
+#if 0
+  uint16_t data = width;
+  write(fd, &data, sizeof(data));
+  data = height;
+  write(fd, &data, sizeof(data));
+#endif
+
+  size_t frameSize = width * height;
+  for (int i = 0; i < numFrames; i++) {
+    write(fd, frameBuffer + (i * frameSize), frameSize);
+  }
+  close(fd);
+}
+
 int
-main()
+main(int argc, char* argv[])
 {
   printf("Hello world!\n");
+
+  int numSecs = 10;
+  if (argc > 1) {
+    numSecs = atoi(argv[1]);
+  }
 
   char* frameBuffer = (char*)mmap(nullptr, kFrameBufferSize,
                                   PROT_READ | PROT_WRITE,
@@ -245,15 +375,20 @@ main()
     Fail("EnableVideoInput failed");
   }
 
+  if (input->EnableAudioInput(bmdAudioSampleRate48kHz,
+                              bmdAudioSampleType16bitInteger,
+                              2) != S_OK) {
+    Fail("EnableAudioInput failed");
+  }
+
   CaptureCallback* callback = new CaptureCallback(input, frameBuffer);
   input->SetCallback(callback);
 
   input->StartStreams();
 
-  const int kNumSeconds = 2;
-  const size_t kNumFrames = kNumSeconds * 60;
+  int numFrames = numSecs * 60;
 
-  while (gFrameCounter < kNumFrames) {
+  while (gFrameCounter < numFrames) {
     sched_yield();
   }
 
@@ -263,6 +398,10 @@ main()
 
   if (input->DisableVideoInput() != S_OK) {
     Fail("DisableVideoInput failed");
+  }
+
+  if (input->DisableAudioInput() != S_OK) {
+    Fail("DisableAudioInput failed");
   }
 
   printf("Finished recording.\n");
@@ -278,18 +417,8 @@ main()
 
   printf("Writing to disk...\n");
 
-  int fd = open("video.raw", O_WRONLY|O_CREAT|O_TRUNC, 0664);
-
-  uint16_t data = width;
-  write(fd, &data, sizeof(data));
-  data = height;
-  write(fd, &data, sizeof(data));
-
-  size_t frameSize = width * height;
-  for (int i = 0; i < kNumFrames; i++) {
-    write(fd, frameBuffer + (i * frameSize), frameSize);
-  }
-  close(fd);
+  //WriteRaw("video.raw", width, height, frameBuffer, numFrames);
+  WriteCompressed("video.pop", "video.idx", width, height, frameBuffer, numFrames);
 
   printf("Done.\n");
 
